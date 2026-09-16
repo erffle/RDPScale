@@ -15,16 +15,18 @@ include(FetchContent)
 FetchContent_Declare(
     detours_src
     GIT_REPOSITORY https://github.com/microsoft/Detours.git
-    GIT_TAG v4.0.1
-    GIT_SHALLOW TRUE
+    # Pinned after the upstream VS/MSVC C2362 fixes; current upstream as of
+    # 2026-09-16. Pinning keeps public builds reproducible.
+    GIT_TAG adb07604aa56508448b95bf037c2a6d0d3b6831a
+    GIT_SHALLOW FALSE
 )
 FetchContent_GetProperties(detours_src)
 if(NOT detours_src_POPULATED)
     FetchContent_Populate(detours_src)
 endif()
 
-# Detours 4.0.1 ships with nmake files rather than a CMake project. Build the
-# same source set used by its official static library.
+# Detours ships with nmake files rather than a CMake project. Build the same
+# source set used by its official static library.
 add_library(detours STATIC
     ${detours_src_SOURCE_DIR}/src/detours.cpp
     ${detours_src_SOURCE_DIR}/src/modules.cpp
