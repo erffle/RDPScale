@@ -1,0 +1,51 @@
+name: Build RDPScale
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES.md"
+      - ".github/workflows/build.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "LICENSE"
+      - "THIRD_PARTY_NOTICES.md"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure x64 Release
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Add licenses to distribution
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE build/out/LICENSE.txt
+          Copy-Item THIRD_PARTY_NOTICES.md build/out/THIRD_PARTY_NOTICES.md
+          Get-ChildItem build/out
+
+      - name: Upload x64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RDPScale-x64
+          path: build/out/*
+          retention-days: 7
+          if-no-files-found: error
