@@ -1,0 +1,3 @@
+LIBRARY RDPScaleHook
+EXPORTS
+    DetourFinishHelperProcess @1
