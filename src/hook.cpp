@@ -17,9 +17,9 @@ UINT g_effectiveDpi = 96;
 
 void SignalFromEnvironment(const wchar_t* variableName) {
     wchar_t eventName[512]{};
-    const DWORD chars = GetEnvironmentVariableW(
-        variableName, eventName, static_cast<DWORD>(std::size(eventName)));
-    if (chars == 0 || chars >= std::size(eventName)) {
+    const DWORD capacity = static_cast<DWORD>(ARRAYSIZE(eventName));
+    const DWORD chars = GetEnvironmentVariableW(variableName, eventName, capacity);
+    if (chars == 0 || chars >= capacity) {
         return;
     }
 
@@ -32,9 +32,9 @@ void SignalFromEnvironment(const wchar_t* variableName) {
 
 bool ReadDpiFromEnvironment() {
     wchar_t dpiBuffer[32]{};
-    const DWORD chars = GetEnvironmentVariableW(
-        L"RDPSCALE_DPI", dpiBuffer, static_cast<DWORD>(std::size(dpiBuffer)));
-    if (chars == 0 || chars >= std::size(dpiBuffer)) {
+    const DWORD capacity = static_cast<DWORD>(ARRAYSIZE(dpiBuffer));
+    const DWORD chars = GetEnvironmentVariableW(L"RDPSCALE_DPI", dpiBuffer, capacity);
+    if (chars == 0 || chars >= capacity) {
         return false;
     }
 
