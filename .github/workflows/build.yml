@@ -3,7 +3,9 @@ name: Build RDPScale
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches:
+      - main
+      - "release/v*"
     tags: ["v*"]
     paths:
       - "src/**"
@@ -11,6 +13,7 @@ on:
       - "LICENSE"
       - "THIRD_PARTY_NOTICES.md"
       - ".github/workflows/build.yml"
+      - ".release-trigger"
   pull_request:
     paths:
       - "src/**"
@@ -52,7 +55,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/v')
     needs: build-x64
     runs-on: windows-latest
     permissions:
@@ -68,7 +71,8 @@ jobs:
       - name: Create release ZIP
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $refName = "${{ github.ref_name }}"
+          $tag = if ($refName.StartsWith("release/")) { $refName.Substring(8) } else { $refName }
           Compress-Archive -Path dist\* -DestinationPath "RDPScale-$tag-x64.zip" -CompressionLevel Optimal
 
       - name: Publish GitHub Release
@@ -76,6 +80,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $refName = "${{ github.ref_name }}"
+          $tag = if ($refName.StartsWith("release/")) { $refName.Substring(8) } else { $refName }
           $zip = "RDPScale-$tag-x64.zip"
-          gh release create $tag $zip --verify-tag --title "RDPScale $tag" --notes "First field-tested working release. Forces an independent effective DPI scale for the stock Windows mstsc.exe client using Microsoft Detours."
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $zip --clobber
+          } else {
+            gh release create $tag $zip --target "${{ github.sha }}" --title "RDPScale $tag" --notes "First field-tested working release. Forces an independent effective DPI scale for the stock Windows mstsc.exe client using Microsoft Detours."
+          }
