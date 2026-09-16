@@ -1,9 +1,8 @@
 #include <windows.h>
 #include <shellscalingapi.h>
-#include <MinHook.h>
+#include <detours.h>
 
 #include <cwchar>
-#include <string>
 
 namespace {
 
@@ -13,21 +12,40 @@ using GetDpiForMonitorFn = HRESULT(WINAPI*)(
     UINT*,
     UINT*);
 
-GetDpiForMonitorFn g_originalGetDpiForMonitor = nullptr;
+GetDpiForMonitorFn g_originalGetDpiForMonitor = GetDpiForMonitor;
 UINT g_effectiveDpi = 96;
 
-std::wstring EventName(const wchar_t* kind) {
-    return std::wstring(L"Local\\RDPScale_") + kind + L"_" +
-           std::to_wstring(GetCurrentProcessId());
-}
+void SignalFromEnvironment(const wchar_t* variableName) {
+    wchar_t eventName[512]{};
+    const DWORD chars = GetEnvironmentVariableW(
+        variableName, eventName, static_cast<DWORD>(std::size(eventName)));
+    if (chars == 0 || chars >= std::size(eventName)) {
+        return;
+    }
 
-void Signal(const wchar_t* kind) {
-    const std::wstring name = EventName(kind);
-    HANDLE eventHandle = OpenEventW(EVENT_MODIFY_STATE, FALSE, name.c_str());
+    HANDLE eventHandle = OpenEventW(EVENT_MODIFY_STATE, FALSE, eventName);
     if (eventHandle) {
         SetEvent(eventHandle);
         CloseHandle(eventHandle);
     }
+}
+
+bool ReadDpiFromEnvironment() {
+    wchar_t dpiBuffer[32]{};
+    const DWORD chars = GetEnvironmentVariableW(
+        L"RDPSCALE_DPI", dpiBuffer, static_cast<DWORD>(std::size(dpiBuffer)));
+    if (chars == 0 || chars >= std::size(dpiBuffer)) {
+        return false;
+    }
+
+    wchar_t* end = nullptr;
+    const unsigned long dpi = std::wcstoul(dpiBuffer, &end, 10);
+    if (!end || *end != L'\0' || dpi < 96 || dpi > 480) {
+        return false;
+    }
+
+    g_effectiveDpi = static_cast<UINT>(dpi);
+    return true;
 }
 
 HRESULT WINAPI HookGetDpiForMonitor(
@@ -51,73 +69,53 @@ HRESULT WINAPI HookGetDpiForMonitor(
     return hr;
 }
 
-DWORD WINAPI InitializeHook(void*) {
-    wchar_t dpiBuffer[32]{};
-    const DWORD chars = GetEnvironmentVariableW(
-        L"RDPSCALE_DPI", dpiBuffer, static_cast<DWORD>(std::size(dpiBuffer)));
-
-    if (chars == 0 || chars >= std::size(dpiBuffer)) {
-        Signal(L"FAILED");
-        return 1;
+bool InstallHook() {
+    if (!ReadDpiFromEnvironment()) {
+        return false;
     }
 
-    wchar_t* end = nullptr;
-    const unsigned long dpi = std::wcstoul(dpiBuffer, &end, 10);
-    if (!end || *end != L'\0' || dpi < 96 || dpi > 480) {
-        Signal(L"FAILED");
-        return 2;
+    if (DetourTransactionBegin() != NO_ERROR) {
+        return false;
     }
-    g_effectiveDpi = static_cast<UINT>(dpi);
-
-    HMODULE shcore = LoadLibraryW(L"shcore.dll");
-    if (!shcore) {
-        Signal(L"FAILED");
-        return 3;
+    if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) {
+        DetourTransactionAbort();
+        return false;
     }
-
-    void* target = reinterpret_cast<void*>(
-        GetProcAddress(shcore, "GetDpiForMonitor"));
-    if (!target) {
-        Signal(L"FAILED");
-        return 4;
+    if (DetourAttach(
+            reinterpret_cast<PVOID*>(&g_originalGetDpiForMonitor),
+            reinterpret_cast<PVOID>(HookGetDpiForMonitor)) != NO_ERROR) {
+        DetourTransactionAbort();
+        return false;
+    }
+    if (DetourTransactionCommit() != NO_ERROR) {
+        return false;
     }
 
-    if (MH_Initialize() != MH_OK) {
-        Signal(L"FAILED");
-        return 5;
-    }
-
-    if (MH_CreateHook(
-            target,
-            reinterpret_cast<void*>(&HookGetDpiForMonitor),
-            reinterpret_cast<void**>(&g_originalGetDpiForMonitor)) != MH_OK) {
-        Signal(L"FAILED");
-        return 6;
-    }
-
-    if (MH_EnableHook(target) != MH_OK) {
-        Signal(L"FAILED");
-        return 7;
-    }
-
-    Signal(L"READY");
-    return 0;
+    return true;
 }
 
 } // namespace
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
+    if (DetourIsHelperProcess()) {
+        return TRUE;
+    }
+
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
 
-        // Do the real initialization outside the loader lock. The launcher keeps
-        // mstsc's primary thread suspended until this worker signals READY.
-        HANDLE thread = CreateThread(nullptr, 0, InitializeHook, nullptr, 0, nullptr);
-        if (thread) {
-            CloseHandle(thread);
-        } else {
-            Signal(L"FAILED");
+        // DetourCreateProcessWithDllEx temporarily modifies mstsc's in-memory
+        // import table. Restore that temporary scaffolding before installing
+        // the actual GetDpiForMonitor detour.
+        DetourRestoreAfterWith();
+
+        if (!InstallHook()) {
+            SignalFromEnvironment(L"RDPSCALE_FAILED_EVENT");
+            return FALSE;
         }
+
+        SignalFromEnvironment(L"RDPSCALE_READY_EVENT");
     }
+
     return TRUE;
 }
