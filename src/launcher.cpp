@@ -1,8 +1,7 @@
 #include <windows.h>
-#include <tlhelp32.h>
+#include <detours.h>
 
 #include <cerrno>
-#include <cstdint>
 #include <cwchar>
 #include <iostream>
 #include <optional>
@@ -20,22 +19,8 @@ public:
     UniqueHandle(const UniqueHandle&) = delete;
     UniqueHandle& operator=(const UniqueHandle&) = delete;
 
-    UniqueHandle(UniqueHandle&& other) noexcept : handle_(other.release()) {}
-    UniqueHandle& operator=(UniqueHandle&& other) noexcept {
-        if (this != &other) {
-            reset(other.release());
-        }
-        return *this;
-    }
-
     HANDLE get() const { return handle_; }
     explicit operator bool() const { return handle_ && handle_ != INVALID_HANDLE_VALUE; }
-
-    HANDLE release() {
-        HANDLE value = handle_;
-        handle_ = nullptr;
-        return value;
-    }
 
     void reset(HANDLE value = nullptr) {
         if (handle_ && handle_ != INVALID_HANDLE_VALUE) {
@@ -46,6 +31,42 @@ public:
 
 private:
     HANDLE handle_ = nullptr;
+};
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(const wchar_t* name, const std::wstring& value)
+        : name_(name) {
+        const DWORD needed = GetEnvironmentVariableW(name_.c_str(), nullptr, 0);
+        hadOldValue_ = needed != 0;
+        if (hadOldValue_) {
+            oldValue_.resize(needed);
+            const DWORD copied = GetEnvironmentVariableW(name_.c_str(), oldValue_.data(), needed);
+            if (copied < needed) {
+                oldValue_.resize(copied);
+            }
+        }
+        ok_ = SetEnvironmentVariableW(name_.c_str(), value.c_str()) != FALSE;
+    }
+
+    ~ScopedEnvironmentVariable() {
+        if (!ok_) {
+            return;
+        }
+        if (hadOldValue_) {
+            SetEnvironmentVariableW(name_.c_str(), oldValue_.c_str());
+        } else {
+            SetEnvironmentVariableW(name_.c_str(), nullptr);
+        }
+    }
+
+    bool ok() const { return ok_; }
+
+private:
+    std::wstring name_;
+    std::wstring oldValue_;
+    bool hadOldValue_ = false;
+    bool ok_ = false;
 };
 
 std::wstring Win32Message(DWORD error) {
@@ -108,14 +129,12 @@ std::wstring QuoteArg(const std::wstring& arg) {
             ++backslashes;
             continue;
         }
-
         if (ch == L'\"') {
             out.append(backslashes * 2 + 1, L'\\');
             out.push_back(L'\"');
             backslashes = 0;
             continue;
         }
-
         out.append(backslashes, L'\\');
         backslashes = 0;
         out.push_back(ch);
@@ -147,268 +166,41 @@ std::wstring SystemMstscPath() {
     return std::wstring(buffer.data(), length) + L"\\mstsc.exe";
 }
 
-uintptr_t RemoteModuleBase(DWORD pid, const wchar_t* moduleName) {
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        UniqueHandle snapshot(CreateToolhelp32Snapshot(
-            TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid));
-        if (!snapshot) {
-            if (GetLastError() == ERROR_BAD_LENGTH) {
-                Sleep(5);
-                continue;
-            }
-            return 0;
+std::optional<std::string> ToDetoursDllPath(const std::wstring& path) {
+    std::wstring candidate = path;
+
+    auto convert = [](const std::wstring& value) -> std::optional<std::string> {
+        BOOL usedDefault = FALSE;
+        const int needed = WideCharToMultiByte(
+            CP_ACP, WC_NO_BEST_FIT_CHARS, value.c_str(), -1,
+            nullptr, 0, nullptr, &usedDefault);
+        if (needed <= 1 || usedDefault) {
+            return std::nullopt;
         }
 
-        MODULEENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-        if (!Module32FirstW(snapshot.get(), &entry)) {
-            if (GetLastError() == ERROR_BAD_LENGTH) {
-                Sleep(5);
-                continue;
-            }
-            return 0;
+        std::string result(static_cast<size_t>(needed - 1), '\0');
+        usedDefault = FALSE;
+        const int converted = WideCharToMultiByte(
+            CP_ACP, WC_NO_BEST_FIT_CHARS, value.c_str(), -1,
+            result.data(), needed, nullptr, &usedDefault);
+        if (converted != needed || usedDefault) {
+            return std::nullopt;
         }
+        return result;
+    };
 
-        do {
-            if (_wcsicmp(entry.szModule, moduleName) == 0) {
-                return reinterpret_cast<uintptr_t>(entry.modBaseAddr);
-            }
-        } while (Module32NextW(snapshot.get(), &entry));
-
-        return 0;
-    }
-    return 0;
-}
-
-bool SetEntryHardwareBreakpoint(HANDLE thread, uintptr_t entryPoint, bool enable) {
-    CONTEXT context{};
-    context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(thread, &context)) {
-        PrintWin32Error(L"GetThreadContext");
-        return false;
+    if (auto direct = convert(candidate)) {
+        return direct;
     }
 
-#if defined(_M_X64)
-    if (enable) {
-        context.Dr0 = static_cast<DWORD64>(entryPoint);
-        // L0=1, RW0=00 (execute), LEN0=00 (1 byte).
-        context.Dr7 &= ~((3ULL << 0) | (0xFULL << 16));
-        context.Dr7 |= 1ULL;
-    } else {
-        context.Dr0 = 0;
-        context.Dr7 &= ~((3ULL << 0) | (0xFULL << 16));
-    }
-#else
-#error RDPScale currently supports x64 only.
-#endif
-
-    if (!SetThreadContext(thread, &context)) {
-        PrintWin32Error(L"SetThreadContext");
-        return false;
-    }
-    return true;
-}
-
-void CloseDebugFileHandle(const DEBUG_EVENT& event) {
-    if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-        if (event.u.CreateProcessInfo.hFile) {
-            CloseHandle(event.u.CreateProcessInfo.hFile);
-        }
-    } else if (event.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
-        if (event.u.LoadDll.hFile) {
-            CloseHandle(event.u.LoadDll.hFile);
-        }
-    }
-}
-
-bool GateAtApplicationEntry(
-    DWORD pid,
-    DWORD primaryThreadId,
-    HANDLE primaryThread) {
-
-    // CreateProcess(DEBUG_ONLY_THIS_PROCESS) stops at the system initial
-    // breakpoint before DLL initialization. We arm a hardware execute
-    // breakpoint at the application's entry point, then let the Windows loader
-    // finish. When that breakpoint fires, no mstsc application instruction has
-    // executed yet, but kernel32 and the rest of the process runtime are ready.
-    uintptr_t entryPoint = 0;
-    bool initialBreakpointSeen = false;
-    const ULONGLONG deadline = GetTickCount64() + 15000;
-
-    if (!DebugSetProcessKillOnExit(FALSE)) {
-        PrintWin32Error(L"DebugSetProcessKillOnExit");
-        return false;
+    std::vector<wchar_t> shortBuffer(32768);
+    const DWORD shortLength = GetShortPathNameW(
+        path.c_str(), shortBuffer.data(), static_cast<DWORD>(shortBuffer.size()));
+    if (shortLength == 0 || shortLength >= shortBuffer.size()) {
+        return std::nullopt;
     }
 
-    while (GetTickCount64() < deadline) {
-        DEBUG_EVENT event{};
-        const ULONGLONG now = GetTickCount64();
-        const DWORD timeout = static_cast<DWORD>(
-            (deadline > now) ? (deadline - now) : 0);
-
-        if (!WaitForDebugEvent(&event, timeout)) {
-            PrintWin32Error(L"WaitForDebugEvent");
-            return false;
-        }
-
-        if (event.dwProcessId != pid) {
-            CloseDebugFileHandle(event);
-            ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
-            continue;
-        }
-
-        if (event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-            entryPoint = reinterpret_cast<uintptr_t>(
-                event.u.CreateProcessInfo.lpStartAddress);
-        }
-
-        CloseDebugFileHandle(event);
-
-        if (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT) {
-            std::wcerr << L"RDPScale: mstsc.exe exited during startup\n";
-            return false;
-        }
-
-        if (event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-            const DWORD code = event.u.Exception.ExceptionRecord.ExceptionCode;
-            const uintptr_t address = reinterpret_cast<uintptr_t>(
-                event.u.Exception.ExceptionRecord.ExceptionAddress);
-
-            if (!initialBreakpointSeen && code == EXCEPTION_BREAKPOINT) {
-                if (entryPoint == 0) {
-                    std::wcerr << L"RDPScale: debugger did not report mstsc entry point\n";
-                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
-                    return false;
-                }
-
-                if (!SetEntryHardwareBreakpoint(primaryThread, entryPoint, true)) {
-                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
-                    return false;
-                }
-
-                initialBreakpointSeen = true;
-                if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE)) {
-                    PrintWin32Error(L"ContinueDebugEvent");
-                    return false;
-                }
-                continue;
-            }
-
-            if (initialBreakpointSeen &&
-                code == EXCEPTION_SINGLE_STEP &&
-                event.dwThreadId == primaryThreadId &&
-                address == entryPoint) {
-
-                if (!SetEntryHardwareBreakpoint(primaryThread, entryPoint, false)) {
-                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
-                    return false;
-                }
-
-                if (SuspendThread(primaryThread) == static_cast<DWORD>(-1)) {
-                    PrintWin32Error(L"SuspendThread");
-                    ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
-                    return false;
-                }
-
-                if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE)) {
-                    PrintWin32Error(L"ContinueDebugEvent");
-                    ResumeThread(primaryThread);
-                    return false;
-                }
-
-                // There must be no outstanding debug event when detaching.
-                if (!DebugActiveProcessStop(pid)) {
-                    PrintWin32Error(L"DebugActiveProcessStop");
-                    ResumeThread(primaryThread);
-                    return false;
-                }
-
-                return true;
-            }
-
-            const DWORD continueStatus =
-                (code == EXCEPTION_BREAKPOINT || code == EXCEPTION_SINGLE_STEP)
-                    ? DBG_CONTINUE
-                    : DBG_EXCEPTION_NOT_HANDLED;
-
-            if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, continueStatus)) {
-                PrintWin32Error(L"ContinueDebugEvent");
-                return false;
-            }
-            continue;
-        }
-
-        if (!ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE)) {
-            PrintWin32Error(L"ContinueDebugEvent");
-            return false;
-        }
-    }
-
-    std::wcerr << L"RDPScale: timed out waiting for mstsc application entry point\n";
-    return false;
-}
-
-bool InjectLibrary(DWORD pid, HANDLE process, const std::wstring& dllPath) {
-    const size_t byteCount = (dllPath.size() + 1) * sizeof(wchar_t);
-    void* remoteString = VirtualAllocEx(
-        process, nullptr, byteCount, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!remoteString) {
-        PrintWin32Error(L"VirtualAllocEx");
-        return false;
-    }
-
-    auto freeRemote = [&]() { VirtualFreeEx(process, remoteString, 0, MEM_RELEASE); };
-
-    SIZE_T written = 0;
-    if (!WriteProcessMemory(process, remoteString, dllPath.c_str(), byteCount, &written) ||
-        written != byteCount) {
-        PrintWin32Error(L"WriteProcessMemory");
-        freeRemote();
-        return false;
-    }
-
-    HMODULE localKernel32 = GetModuleHandleW(L"kernel32.dll");
-    FARPROC localLoadLibrary = localKernel32 ? GetProcAddress(localKernel32, "LoadLibraryW") : nullptr;
-    const uintptr_t remoteKernel32 = RemoteModuleBase(pid, L"kernel32.dll");
-    if (!localKernel32 || !localLoadLibrary || !remoteKernel32) {
-        std::wcerr << L"RDPScale: could not resolve remote LoadLibraryW after loader initialization\n";
-        freeRemote();
-        return false;
-    }
-
-    const uintptr_t loadLibraryOffset =
-        reinterpret_cast<uintptr_t>(localLoadLibrary) - reinterpret_cast<uintptr_t>(localKernel32);
-    const auto remoteLoadLibrary = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        remoteKernel32 + loadLibraryOffset);
-
-    UniqueHandle thread(CreateRemoteThread(
-        process, nullptr, 0, remoteLoadLibrary, remoteString, 0, nullptr));
-    if (!thread) {
-        PrintWin32Error(L"CreateRemoteThread");
-        freeRemote();
-        return false;
-    }
-
-    const DWORD wait = WaitForSingleObject(thread.get(), 10000);
-    if (wait != WAIT_OBJECT_0) {
-        std::wcerr << L"RDPScale: timed out loading hook DLL\n";
-        freeRemote();
-        return false;
-    }
-
-    DWORD loadResult = 0;
-    if (!GetExitCodeThread(thread.get(), &loadResult) || loadResult == 0) {
-        std::wcerr << L"RDPScale: LoadLibraryW failed inside mstsc.exe\n";
-        freeRemote();
-        return false;
-    }
-
-    freeRemote();
-    return true;
-}
-
-std::wstring EventName(const wchar_t* kind, DWORD pid) {
-    return std::wstring(L"Local\\RDPScale_") + kind + L"_" + std::to_wstring(pid);
+    return convert(std::wstring(shortBuffer.data(), shortLength));
 }
 
 void PrintUsage() {
@@ -497,6 +289,13 @@ int wmain(int argc, wchar_t* argv[]) {
         return 3;
     }
 
+    const auto hookPathAnsi = ToDetoursDllPath(hookPath);
+    if (!hookPathAnsi) {
+        std::wcerr << L"RDPScale: hook DLL path cannot be represented for Detours. "
+                   << L"Move RDPScale to a path containing ASCII characters.\n";
+        return 3;
+    }
+
     std::wstring commandLine = QuoteArg(mstscPath);
     for (const auto& arg : mstscArgs) {
         commandLine.push_back(L' ');
@@ -505,101 +304,74 @@ int wmain(int argc, wchar_t* argv[]) {
     std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back(L'\0');
 
-    const wchar_t* envName = L"RDPSCALE_DPI";
-    DWORD previousSize = GetEnvironmentVariableW(envName, nullptr, 0);
-    std::wstring previousValue;
-    const bool hadPrevious = previousSize != 0;
-    if (hadPrevious) {
-        previousValue.resize(previousSize);
-        const DWORD copied = GetEnvironmentVariableW(envName, previousValue.data(), previousSize);
-        if (copied < previousSize) {
-            previousValue.resize(copied);
-        }
+    const std::wstring token = std::to_wstring(GetCurrentProcessId()) + L"_" +
+                               std::to_wstring(GetTickCount64());
+    const std::wstring readyEventName = L"Local\\RDPScale_READY_" + token;
+    const std::wstring failedEventName = L"Local\\RDPScale_FAILED_" + token;
+
+    UniqueHandle readyEvent(CreateEventW(nullptr, TRUE, FALSE, readyEventName.c_str()));
+    UniqueHandle failedEvent(CreateEventW(nullptr, TRUE, FALSE, failedEventName.c_str()));
+    if (!readyEvent || !failedEvent) {
+        PrintWin32Error(L"CreateEventW");
+        return 4;
     }
 
-    const std::wstring dpiValue = std::to_wstring(*dpi);
-    if (!SetEnvironmentVariableW(envName, dpiValue.c_str())) {
+    ScopedEnvironmentVariable dpiEnv(L"RDPSCALE_DPI", std::to_wstring(*dpi));
+    ScopedEnvironmentVariable readyEnv(L"RDPSCALE_READY_EVENT", readyEventName);
+    ScopedEnvironmentVariable failedEnv(L"RDPSCALE_FAILED_EVENT", failedEventName);
+    if (!dpiEnv.ok() || !readyEnv.ok() || !failedEnv.ok()) {
         PrintWin32Error(L"SetEnvironmentVariableW");
-        return 3;
+        return 4;
     }
 
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION processInfo{};
 
-    // Start under the lightweight Win32 debugger gate. This lets Windows finish
-    // loader initialization while we stop exactly at mstsc's application entry
-    // point, before any mstsc instruction executes.
-    const BOOL created = CreateProcessW(
+    // Microsoft Detours creates the target suspended, patches its in-memory
+    // import table so RDPScaleHook.dll is loaded before application code, and
+    // then resumes it. This avoids timing races and debugger dependencies.
+    const BOOL created = DetourCreateProcessWithDllExW(
         mstscPath.c_str(),
         mutableCommand.data(),
         nullptr,
         nullptr,
         FALSE,
-        DEBUG_ONLY_THIS_PROCESS,
+        0,
         nullptr,
         nullptr,
         &startup,
-        &processInfo);
-
-    if (hadPrevious) {
-        SetEnvironmentVariableW(envName, previousValue.c_str());
-    } else {
-        SetEnvironmentVariableW(envName, nullptr);
-    }
+        &processInfo,
+        hookPathAnsi->c_str(),
+        nullptr);
 
     if (!created) {
-        PrintWin32Error(L"CreateProcessW");
-        return 4;
+        PrintWin32Error(L"DetourCreateProcessWithDllExW");
+        return 5;
     }
 
     UniqueHandle process(processInfo.hProcess);
     UniqueHandle primaryThread(processInfo.hThread);
-    const DWORD pid = processInfo.dwProcessId;
-    const DWORD primaryThreadId = processInfo.dwThreadId;
 
-    if (!GateAtApplicationEntry(pid, primaryThreadId, primaryThread.get())) {
-        DebugActiveProcessStop(pid);
-        TerminateProcess(process.get(), 1);
-        return 5;
-    }
-
-    const std::wstring readyName = EventName(L"READY", pid);
-    const std::wstring failedName = EventName(L"FAILED", pid);
-    UniqueHandle readyEvent(CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()));
-    UniqueHandle failedEvent(CreateEventW(nullptr, TRUE, FALSE, failedName.c_str()));
-
-    if (!readyEvent || !failedEvent) {
-        PrintWin32Error(L"CreateEventW");
-        TerminateProcess(process.get(), 1);
-        return 6;
-    }
-
-    if (!InjectLibrary(pid, process.get(), hookPath)) {
-        TerminateProcess(process.get(), 1);
-        return 7;
-    }
-
-    HANDLE events[] = {readyEvent.get(), failedEvent.get()};
-    const DWORD hookWait = WaitForMultipleObjects(2, events, FALSE, 10000);
+    HANDLE waits[] = {readyEvent.get(), failedEvent.get(), process.get()};
+    const DWORD hookWait = WaitForMultipleObjects(3, waits, FALSE, 10000);
     if (hookWait == WAIT_OBJECT_0 + 1) {
         std::wcerr << L"RDPScale: hook DLL reported initialization failure\n";
-        TerminateProcess(process.get(), 1);
-        return 8;
+        return 6;
+    }
+    if (hookWait == WAIT_OBJECT_0 + 2) {
+        DWORD exitCode = 0;
+        GetExitCodeProcess(process.get(), &exitCode);
+        std::wcerr << L"RDPScale: mstsc.exe exited before the DPI hook initialized "
+                   << L"(exit code " << exitCode << L")\n";
+        return 6;
     }
     if (hookWait != WAIT_OBJECT_0) {
         std::wcerr << L"RDPScale: timed out waiting for the DPI hook\n";
-        TerminateProcess(process.get(), 1);
-        return 8;
+        return 6;
     }
 
-    if (ResumeThread(primaryThread.get()) == static_cast<DWORD>(-1)) {
-        PrintWin32Error(L"ResumeThread");
-        TerminateProcess(process.get(), 1);
-        return 9;
-    }
-
-    std::wcout << L"RDPScale: started mstsc.exe PID " << pid
+    std::wcout << L"RDPScale: started mstsc.exe PID " << processInfo.dwProcessId
                << L" with effective DPI " << *dpi;
     if (scale) {
         std::wcout << L" (" << *scale << L"%)";
