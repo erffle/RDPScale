@@ -4,11 +4,11 @@ RDPScale launches the built-in Windows Remote Desktop client (`mstsc.exe`) with 
 
 For example, a local 4K desktop can remain at 175% while an RDP session is started at 100% or 125%.
 
-> **Status:** early experimental implementation. CI build and real-machine validation are the next steps.
+> **Status:** v0.1.0 working baseline. Field-tested on Windows 11 x64 with the stock Microsoft Remote Desktop client.
 
 ## Why
 
-Recent Windows versions may ignore or effectively override the legacy `.rdp` `desktopscalefactor` setting. RDPScale takes a different approach: it starts `mstsc.exe` suspended, injects a very small helper DLL, installs a hook for `shcore!GetDpiForMonitor`, and only then resumes `mstsc.exe`.
+Recent Windows versions may ignore or effectively override the legacy `.rdp` `desktopscalefactor` setting. RDPScale takes a different approach: it starts `mstsc.exe` through Microsoft Detours, causes `RDPScaleHook.dll` to be loaded before the application code runs, and hooks `shcore!GetDpiForMonitor`.
 
 The RDP protocol, credentials, TLS, networking, clipboard, audio, drives, and authentication remain handled by Microsoft's own `mstsc.exe`.
 
@@ -46,22 +46,39 @@ All arguments other than `/scale:` or `/dpi:` are passed to `mstsc.exe`.
 ```text
 RDPScale.exe
     |
-    +-- CreateProcess(mstsc.exe, CREATE_SUSPENDED)
-    |
-    +-- inject RDPScaleHook.dll
-    |       |
-    |       +-- hook shcore!GetDpiForMonitor
-    |
-    +-- wait until the hook reports READY
-    |
-    +-- ResumeThread(mstsc)
+    +-- DetourCreateProcessWithDllExW(mstsc.exe, RDPScaleHook.dll)
+            |
+            +-- Windows loader loads RDPScaleHook.dll before mstsc application code
+                    |
+                    +-- hook shcore!GetDpiForMonitor
+                    +-- override MDT_EFFECTIVE_DPI only
 ```
 
-The hook only overrides `MDT_EFFECTIVE_DPI`; raw and angular DPI queries are left untouched.
+The hook changes only `MDT_EFFECTIVE_DPI`; raw and angular DPI queries are left untouched.
+
+## Windows 11 connection security warning
+
+Starting with the April 2026 Windows security update, opening an `.rdp` file can show the new **Unknown remote connection** security dialog on every launch.
+
+Microsoft currently provides a compatibility switch that restores the previous dialog behavior. Run an elevated Command Prompt:
+
+```cmd
+reg add "HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services\Client" /v RedirectionWarningDialogVersion /t REG_DWORD /d 1 /f
+```
+
+Close existing `mstsc.exe` processes and reconnect.
+
+To return to the current Windows default behavior:
+
+```cmd
+reg delete "HKLM\Software\Policies\Microsoft\Windows NT\Terminal Services\Client" /v RedirectionWarningDialogVersion /f
+```
+
+Microsoft documents this as a temporary compatibility option and notes that a future Windows update may remove it.
 
 ## Build
 
-The repository is intended to build on GitHub Actions using Microsoft's Windows runner, MSVC, CMake, and a pinned MinHook release. No compiler is required on the machine where RDPScale is used.
+The repository builds on GitHub Actions using Microsoft's Windows runner, MSVC, CMake, and a pinned Microsoft Detours commit. No compiler is required on the machine where RDPScale is used.
 
 Local build, if desired:
 
@@ -79,8 +96,10 @@ RDPScaleHook.dll
 
 ## Security notes
 
-RDPScale uses DLL injection and API hooking for the narrow purpose of changing the DPI value observed by `mstsc.exe`. Security software can treat injection techniques as suspicious even when the use is benign. Source code and CI build instructions are kept public so the resulting binaries can be audited and rebuilt.
+RDPScale uses DLL injection and API hooking for the narrow purpose of changing the DPI value observed by `mstsc.exe`. Security software can treat injection techniques as suspicious even when the use is benign. Source code and CI build instructions are public so the resulting binaries can be audited and rebuilt.
+
+RDPScale does not implement, proxy, or modify the RDP protocol itself.
 
 ## License
 
-RDPScale is released under the MIT License. MinHook is used under its BSD 2-Clause license; see `THIRD_PARTY_NOTICES.md`.
+RDPScale is released under the MIT License. Microsoft Detours is used under its MIT License; see `THIRD_PARTY_NOTICES.md`.
