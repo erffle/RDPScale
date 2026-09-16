@@ -79,6 +79,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           $refName = "${{ github.ref_name }}"
           $tag = if ($refName.StartsWith("release/")) { $refName.Substring(8) } else { $refName }
