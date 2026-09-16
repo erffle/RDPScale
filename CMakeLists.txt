@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(RDPScale VERSION 0.1.0 LANGUAGES C CXX)
+project(RDPScale VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,14 +12,33 @@ if(MSVC)
 endif()
 
 include(FetchContent)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
-    minhook
-    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG v1.3.4
+    detours_src
+    GIT_REPOSITORY https://github.com/microsoft/Detours.git
+    GIT_TAG v4.0.1
     GIT_SHALLOW TRUE
 )
-FetchContent_MakeAvailable(minhook)
+FetchContent_GetProperties(detours_src)
+if(NOT detours_src_POPULATED)
+    FetchContent_Populate(detours_src)
+endif()
+
+# Detours 4.0.1 ships with nmake files rather than a CMake project. Build the
+# same source set used by its official static library.
+add_library(detours STATIC
+    ${detours_src_SOURCE_DIR}/src/detours.cpp
+    ${detours_src_SOURCE_DIR}/src/modules.cpp
+    ${detours_src_SOURCE_DIR}/src/disasm.cpp
+    ${detours_src_SOURCE_DIR}/src/image.cpp
+    ${detours_src_SOURCE_DIR}/src/creatwth.cpp
+    ${detours_src_SOURCE_DIR}/src/disolx86.cpp
+    ${detours_src_SOURCE_DIR}/src/disolx64.cpp
+    ${detours_src_SOURCE_DIR}/src/disolia64.cpp
+    ${detours_src_SOURCE_DIR}/src/disolarm.cpp
+    ${detours_src_SOURCE_DIR}/src/disolarm64.cpp
+)
+target_include_directories(detours PUBLIC ${detours_src_SOURCE_DIR}/src)
+target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 add_executable(RDPScale
     src/launcher.cpp
@@ -27,9 +46,11 @@ add_executable(RDPScale
 
 add_library(RDPScaleHook SHARED
     src/hook.cpp
+    src/hook.def
 )
 
-target_link_libraries(RDPScaleHook PRIVATE minhook)
+target_link_libraries(RDPScale PRIVATE detours)
+target_link_libraries(RDPScaleHook PRIVATE detours Shcore)
 
 foreach(target RDPScale RDPScaleHook)
     target_compile_definitions(${target} PRIVATE
