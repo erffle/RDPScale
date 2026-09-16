@@ -167,8 +167,6 @@ std::wstring SystemMstscPath() {
 }
 
 std::optional<std::string> ToDetoursDllPath(const std::wstring& path) {
-    std::wstring candidate = path;
-
     auto convert = [](const std::wstring& value) -> std::optional<std::string> {
         BOOL usedDefault = FALSE;
         const int needed = WideCharToMultiByte(
@@ -178,7 +176,7 @@ std::optional<std::string> ToDetoursDllPath(const std::wstring& path) {
             return std::nullopt;
         }
 
-        std::string result(static_cast<size_t>(needed - 1), '\0');
+        std::string result(static_cast<size_t>(needed), '\0');
         usedDefault = FALSE;
         const int converted = WideCharToMultiByte(
             CP_ACP, WC_NO_BEST_FIT_CHARS, value.c_str(), -1,
@@ -186,10 +184,11 @@ std::optional<std::string> ToDetoursDllPath(const std::wstring& path) {
         if (converted != needed || usedDefault) {
             return std::nullopt;
         }
+        result.pop_back(); // remove the converted NUL terminator
         return result;
     };
 
-    if (auto direct = convert(candidate)) {
+    if (auto direct = convert(path)) {
         return direct;
     }
 
