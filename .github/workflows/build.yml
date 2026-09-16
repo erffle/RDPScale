@@ -3,9 +3,7 @@ name: Build RDPScale
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - "release/v*"
+    branches: [main]
     tags: ["v*"]
     paths:
       - "src/**"
@@ -13,7 +11,6 @@ on:
       - "LICENSE"
       - "THIRD_PARTY_NOTICES.md"
       - ".github/workflows/build.yml"
-      - ".release-trigger"
   pull_request:
     paths:
       - "src/**"
@@ -55,7 +52,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/heads/release/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build-x64
     runs-on: windows-latest
     permissions:
@@ -71,22 +68,15 @@ jobs:
       - name: Create release ZIP
         shell: pwsh
         run: |
-          $refName = "${{ github.ref_name }}"
-          $tag = if ($refName.StartsWith("release/")) { $refName.Substring(8) } else { $refName }
+          $tag = "${{ github.ref_name }}"
           Compress-Archive -Path dist\* -DestinationPath "RDPScale-$tag-x64.zip" -CompressionLevel Optimal
 
       - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          $refName = "${{ github.ref_name }}"
-          $tag = if ($refName.StartsWith("release/")) { $refName.Substring(8) } else { $refName }
+          $tag = "${{ github.ref_name }}"
           $zip = "RDPScale-$tag-x64.zip"
-
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $zip --clobber
-          } else {
-            gh release create $tag $zip --target "${{ github.sha }}" --title "RDPScale $tag" --notes "First field-tested working release. Forces an independent effective DPI scale for the stock Windows mstsc.exe client using Microsoft Detours."
-          }
+          gh release create $tag $zip --verify-tag --title "RDPScale $tag" --generate-notes
